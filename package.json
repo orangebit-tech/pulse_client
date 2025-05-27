@@ -4,7 +4,7 @@
   "description": "Pulse client agent that reports system metrics to master server",
   "main": "pulse_client.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node pulse_client.js"
   },
   "author": "Orange Bit Technologies",
   "license": "MIT",
