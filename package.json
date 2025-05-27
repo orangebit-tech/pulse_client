@@ -1,0 +1,17 @@
+{
+  "name": "pulse-client",
+  "version": "1.0.0",
+  "description": "Pulse client agent that reports system metrics to master server",
+  "main": "pulse_client.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Orange Bit Technologies",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "os": "^0.1.2",
+    "socket.io-client": "^4.7.5",
+    "systeminformation": "^5.20.6"
+  }
+}
