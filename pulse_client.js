@@ -7,7 +7,7 @@ console.log("[CLIENT] Pulse client starting...");
 
 // Update here
 const INSTANCE_TYPE = "web-server" // e.g. "web-server", "api-server", "database-compute-server" etc.
-const DOMAIN = 'pulse.orangebit.dev'; // Your Domain here
+const domain = 'pulse.orangebit.dev'; // Your Domain here
 const HEALTH_PORT = 9443;
 const ENABLE_CERT_CHECK = true;
 // --
@@ -31,10 +31,10 @@ async function fetchClientIP() {
 
 async function checkMasterCertificate() {
   return new Promise((resolve, reject) => {
-    console.log(`[CLIENT] Checking master certificate at ${DOMAIN}`);
+    console.log(`[CLIENT] Checking master certificate at ${domain}`);
     const https = require('https'); 
     const req = https.request({
-      hostname: DOMAIN,
+      hostname: domain,
       port: 443,
       method: 'GET',
     }, (res) => {
@@ -53,7 +53,7 @@ async function checkMasterCertificate() {
       console.error(`[ERROR] Certificate check failed: ${err.message}`);
       resolve(); // proceed without crashing
     });
-    console.log(`[CLIENT] Finished checking master certificate at ${DOMAIN}:443`);
+    console.log(`[CLIENT] Finished checking master certificate at ${domain}:443`);
     req.end();
   });
 }
@@ -71,7 +71,7 @@ async function sendMetrics(socket) {
     const disk = disks[0] || {};
 
     latestMetrics = {
-      DOMAIN,
+      domain,
       role: "api",
       instanceType: INSTANCE_TYPE,
       id: "",
@@ -117,7 +117,7 @@ async function init() {
   });
 
   socket.on('connect', () => {
-    console.log(`[CLIENT] Connected to master as ${DOMAIN}`);
+    console.log(`[CLIENT] Connected to master as ${domain}`);
     setInterval(() => sendMetrics(socket), 1000);
   });
 
@@ -130,7 +130,7 @@ async function init() {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
-      DOMAIN,
+      domain,
       updatedAt: latestMetrics.updatedAt || null,
       metrics: latestMetrics.metrics || {}
     }));
