@@ -4,15 +4,17 @@ const si = require('systeminformation');
 const os = require('os');
 const axios = require('axios');
 console.log("[CLIENT] Pulse client starting...");
+require('dotenv').config();
 
 // Update here
-const INSTANCE_TYPE = "web-server" // e.g. "web-server", "api-server", "database-compute-server" etc.
-const domain = 'pulse.orangebit.dev'; // Your Domain here
-const HEALTH_PORT = 9443;
-const ENABLE_CERT_CHECK = true;
-// --
 
-const masterUrl = 'https://pulse.orangebit.dev:3000'; // do not change
+const INSTANCE_TYPE = process.env.INSTANCE_TYPE || 'web-server';
+const domain = process.env.DOMAIN || 'localhost';
+const HEALTH_PORT = parseInt(process.env.HEALTH_PORT) || 9443;
+const ENABLE_CERT_CHECK = process.env.ENABLE_CERT_CHECK === 'true';
+const masterUrl = process.env.MASTER_URL;
+
+
 let latestMetrics = {};
 let clientIP = '0.0.0.0';
 let certExpiration = null;
@@ -71,10 +73,10 @@ async function sendMetrics(socket) {
     const disk = disks[0] || {};
 
     latestMetrics = {
-      domain,
+      domain: domain,
       role: "api",
       instanceType: INSTANCE_TYPE,
-      id: "",
+      id: `${INSTANCE_TYPE}_${clientIP}`,
       ip: clientIP,
       metrics: {
         cpuLoad: cpu.currentLoad,
