@@ -18,7 +18,14 @@ const HOST_KEY = process.env.HOST_KEY || `${os.hostname()}-${INSTANCE_TYPE}`;
 const METRICS_INTERVAL_MS = parseInt(process.env.METRICS_INTERVAL_MS, 10) || 10000;
 const INCLUDE_DOCKER_CONTAINERS = process.env.INCLUDE_DOCKER_CONTAINERS === 'true';
 const DOCKER_CONTAINERS_LIMIT = parseInt(process.env.DOCKER_CONTAINERS_LIMIT || '20', 10);
+const DOCKER_CONTAINERS_INTERVAL_MS = parseInt(
+  process.env.DOCKER_CONTAINERS_INTERVAL_MS || '60000',
+  10,
+);
 let dockerContainersLogged = false;
+let lastDockerContainers = null;
+let lastDockerContainersHash = null;
+let lastDockerContainersAt = 0;
 
 
 let latestMetrics = {};
@@ -106,24 +113,36 @@ async function collectMetrics() {
   let dockerContainers = null;
   if (INCLUDE_DOCKER_CONTAINERS) {
     try {
-      const containers = await si.dockerContainers();
-      dockerContainers = containers
-        .slice(0, Math.max(DOCKER_CONTAINERS_LIMIT, 0))
-        .map((container) => ({
-          id: container.id,
-          name: container.name,
-          image: container.image,
-          state: container.state,
-          status: container.status,
-          ports: container.ports,
-        }));
-      if (!dockerContainersLogged) {
-        dockerContainersLogged = true;
-        console.log(
-          `[CLIENT] Docker containers collected: ${dockerContainers.length} (limit ${DOCKER_CONTAINERS_LIMIT})`,
-        );
-        if (dockerContainers.length === 0) {
-          console.warn('[CLIENT] Docker containers list is empty');
+      const now = Date.now();
+      if (now - lastDockerContainersAt >= DOCKER_CONTAINERS_INTERVAL_MS) {
+        const containers = await si.dockerContainers();
+        const normalized = containers
+          .slice(0, Math.max(DOCKER_CONTAINERS_LIMIT, 0))
+          .map((container) => ({
+            id: container.id,
+            name: container.name,
+            image: container.image,
+            state: container.state,
+            status: container.status,
+            ports: container.ports,
+          }));
+        const nextHash = JSON.stringify(normalized);
+        if (nextHash !== lastDockerContainersHash) {
+          dockerContainers = normalized;
+          lastDockerContainers = normalized;
+          lastDockerContainersHash = nextHash;
+          lastDockerContainersAt = now;
+          if (!dockerContainersLogged) {
+            dockerContainersLogged = true;
+            console.log(
+              `[CLIENT] Docker containers collected: ${dockerContainers.length} (limit ${DOCKER_CONTAINERS_LIMIT})`,
+            );
+            if (dockerContainers.length === 0) {
+              console.warn('[CLIENT] Docker containers list is empty');
+            }
+          }
+        } else {
+          lastDockerContainersAt = now;
         }
       }
     } catch (err) {
@@ -148,7 +167,7 @@ async function collectMetrics() {
     dockerContainersRunning: docker?.containersRunning ?? null,
     dockerContainersPaused: docker?.containersPaused ?? null,
     dockerContainersStopped: docker?.containersStopped ?? null,
-    dockerContainers,
+    dockerContainers: dockerContainers ?? lastDockerContainers,
     https: isHttpsReachable,
     certExpiration: certExpiration
   };
