@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  pulse-client:
+    build: .
+    container_name: pulse-client
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+    ports:
+      - "9443:9443"
+    restart: unless-stopped
