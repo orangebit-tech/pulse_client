@@ -111,6 +111,7 @@ async function collectMetrics() {
     console.warn('[CLIENT] Docker info unavailable:', err.message);
   }
   let dockerContainers = null;
+  let dockerContainersPayload = null;
   if (INCLUDE_DOCKER_CONTAINERS) {
     try {
       const now = Date.now();
@@ -129,6 +130,7 @@ async function collectMetrics() {
         const nextHash = JSON.stringify(normalized);
         if (nextHash !== lastDockerContainersHash) {
           dockerContainers = normalized;
+          dockerContainersPayload = normalized;
           lastDockerContainers = normalized;
           lastDockerContainersHash = nextHash;
           lastDockerContainersAt = now;
@@ -142,8 +144,11 @@ async function collectMetrics() {
             }
           }
         } else {
+          dockerContainersPayload = { same: true };
           lastDockerContainersAt = now;
         }
+      } else if (lastDockerContainersHash) {
+        dockerContainersPayload = { same: true };
       }
     } catch (err) {
       console.warn('[CLIENT] Docker containers unavailable:', err.message);
@@ -167,7 +172,7 @@ async function collectMetrics() {
     dockerContainersRunning: docker?.containersRunning ?? null,
     dockerContainersPaused: docker?.containersPaused ?? null,
     dockerContainersStopped: docker?.containersStopped ?? null,
-    dockerContainers: dockerContainers ?? lastDockerContainers,
+    dockerContainers: dockerContainersPayload ?? dockerContainers,
     https: isHttpsReachable,
     certExpiration: certExpiration
   };
