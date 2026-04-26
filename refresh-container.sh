@@ -33,3 +33,10 @@ echo "[refresh] Starting pulse-client container..."
 
 echo "[refresh] Current container:"
 docker ps --filter "name=^/pulse-client$" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+
+PID_MODE="$(docker inspect pulse-client --format '{{.HostConfig.PidMode}}')"
+if [[ "$PID_MODE" != "host" ]]; then
+  echo "[refresh] WARNING: pulse-client PidMode is '$PID_MODE', expected 'host'. Host process metrics may not work." >&2
+else
+  echo "[refresh] PidMode: host"
+fi

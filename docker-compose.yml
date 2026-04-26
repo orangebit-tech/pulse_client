@@ -4,6 +4,7 @@ services:
   pulse-client:
     build: .
     container_name: pulse-client
+    pid: host
     env_file:
       - .env
     environment:

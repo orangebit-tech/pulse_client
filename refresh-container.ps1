@@ -42,3 +42,10 @@ Invoke-Compose @("up", "-d", "--no-deps", "pulse-client")
 
 Write-Host "[refresh] Current container:"
 docker ps --filter "name=^/pulse-client$" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+
+$pidMode = docker inspect pulse-client --format "{{.HostConfig.PidMode}}"
+if ($pidMode -ne "host") {
+  Write-Warning "[refresh] pulse-client PidMode is '$pidMode', expected 'host'. Host process metrics may not work."
+} else {
+  Write-Host "[refresh] PidMode: host"
+}
