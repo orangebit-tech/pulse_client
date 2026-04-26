@@ -43,6 +43,7 @@ const DOCKER_CONTAINERS_INTERVAL_MS = parseInt(
 );
 const INCLUDE_PROCESSES = process.env.INCLUDE_PROCESSES !== 'false';
 const PROCESSES_LIMIT = readNonNegativeInt('PROCESSES_LIMIT', 50);
+const NODE_PROCESSES_LIMIT = readNonNegativeInt('NODE_PROCESSES_LIMIT', 50);
 const PROCESSES_INTERVAL_MS = readNonNegativeInt('PROCESSES_INTERVAL_MS', 30000);
 const PROCESS_COMMAND_MAX_LENGTH = readNonNegativeInt('PROCESS_COMMAND_MAX_LENGTH', 240);
 let dockerContainersLogged = false;
@@ -52,6 +53,8 @@ let lastDockerContainersAt = 0;
 let processesLogged = false;
 let lastProcesses = null;
 let lastProcessesHash = null;
+let lastNodeProcesses = null;
+let lastNodeProcessesHash = null;
 let lastProcessesAt = 0;
 let lastProcessSummary = null;
 
@@ -269,11 +272,37 @@ function normalizeProcess(proc, portsByPid) {
   };
 }
 
+function sortProcessesForMonitoring(processes) {
+  return processes.sort((left, right) => {
+    const portDelta = (right.ports.length > 0 ? 1 : 0) - (left.ports.length > 0 ? 1 : 0);
+    if (portDelta !== 0) {
+      return portDelta;
+    }
+    const cpuDelta = (right.cpu || 0) - (left.cpu || 0);
+    if (cpuDelta !== 0) {
+      return cpuDelta;
+    }
+    return (right.memory || 0) - (left.memory || 0);
+  });
+}
+
+function isNodeProcess(proc) {
+  const name = String(proc.name || '').toLowerCase();
+  if (name === 'node' || name === 'nodejs' || name === 'node.exe') {
+    return true;
+  }
+
+  const command = String(proc.command || '').toLowerCase();
+  return /(^|[\s"'=:/\\])(node|nodejs)(\.exe)?($|[\s"'/:\\.-])/.test(command);
+}
+
 async function collectProcessMetrics() {
   if (!INCLUDE_PROCESSES) {
     return {
       summary: null,
       payload: null,
+      nodeSummary: null,
+      nodePayload: null,
     };
   }
 
@@ -282,6 +311,8 @@ async function collectProcessMetrics() {
     return {
       summary: lastProcessSummary,
       payload: lastProcessesHash ? { same: true } : null,
+      nodeSummary: lastProcessSummary?.node ?? null,
+      nodePayload: lastNodeProcessesHash ? { same: true } : null,
     };
   }
 
@@ -290,21 +321,13 @@ async function collectProcessMetrics() {
     const portsByPid = await collectListeningPortsByPid();
     const rawList = Array.isArray(processInfo.list) ? processInfo.list : [];
     const limit = Math.max(PROCESSES_LIMIT, 0);
-    const normalized = rawList
+    const nodeLimit = Math.max(NODE_PROCESSES_LIMIT, 0);
+    const normalizedFullList = rawList
       .filter((proc) => proc.pid !== 0)
-      .map((proc) => normalizeProcess(proc, portsByPid))
-      .sort((left, right) => {
-        const portDelta = (right.ports.length > 0 ? 1 : 0) - (left.ports.length > 0 ? 1 : 0);
-        if (portDelta !== 0) {
-          return portDelta;
-        }
-        const cpuDelta = (right.cpu || 0) - (left.cpu || 0);
-        if (cpuDelta !== 0) {
-          return cpuDelta;
-        }
-        return (right.memory || 0) - (left.memory || 0);
-      })
-      .slice(0, limit);
+      .map((proc) => normalizeProcess(proc, portsByPid));
+    const normalized = sortProcessesForMonitoring([...normalizedFullList]).slice(0, limit);
+    const nodeProcessesFullList = normalizedFullList.filter(isNodeProcess);
+    const nodeProcesses = sortProcessesForMonitoring([...nodeProcessesFullList]).slice(0, nodeLimit);
 
     const summary = {
       total: processInfo.all ?? rawList.length,
@@ -315,27 +338,39 @@ async function collectProcessMetrics() {
       listed: normalized.length,
       limit,
       sampledAt: now,
+      node: {
+        total: nodeProcessesFullList.length,
+        listed: nodeProcesses.length,
+        limit: nodeLimit,
+        sampledAt: now,
+      },
     };
     console.log('[CLIENT] Process query result:', JSON.stringify({
       summary,
       processes: normalized,
+      nodeProcesses,
     }, null, 2));
     const nextHash = JSON.stringify(normalized);
+    const nextNodeHash = JSON.stringify(nodeProcesses);
     lastProcessSummary = summary;
     lastProcessesAt = now;
 
-    if (nextHash === lastProcessesHash) {
-      return {
-        summary,
-        payload: { same: true },
-      };
+    const processesChanged = nextHash !== lastProcessesHash;
+    const nodeProcessesChanged = nextNodeHash !== lastNodeProcessesHash;
+    if (processesChanged) {
+      lastProcesses = normalized;
+      lastProcessesHash = nextHash;
     }
-
-    lastProcesses = normalized;
-    lastProcessesHash = nextHash;
+    if (nodeProcessesChanged) {
+      lastNodeProcesses = nodeProcesses;
+      lastNodeProcessesHash = nextNodeHash;
+    }
     if (!processesLogged) {
       processesLogged = true;
       console.log(`[CLIENT] Processes collected: ${normalized.length}/${summary.total} (limit ${limit})`);
+      console.log(
+        `[CLIENT] Node processes collected: ${nodeProcesses.length}/${summary.node.total} (limit ${nodeLimit})`,
+      );
       if (normalized.length === 0) {
         console.warn('[CLIENT] Process list is empty');
       }
@@ -343,13 +378,17 @@ async function collectProcessMetrics() {
 
     return {
       summary,
-      payload: normalized,
+      payload: processesChanged ? normalized : { same: true },
+      nodeSummary: summary.node,
+      nodePayload: nodeProcessesChanged ? nodeProcesses : { same: true },
     };
   } catch (err) {
     console.warn('[CLIENT] Processes unavailable:', err.message);
     return {
       summary: lastProcessSummary,
       payload: lastProcessesHash ? { same: true } : null,
+      nodeSummary: lastProcessSummary?.node ?? null,
+      nodePayload: lastNodeProcessesHash ? { same: true } : null,
     };
   }
 }
@@ -443,6 +482,10 @@ async function collectMetrics() {
     processesLimit: processMetrics.summary?.limit ?? null,
     processesSampledAt: processMetrics.summary?.sampledAt ?? null,
     processes: processMetrics.payload,
+    nodeProcessesTotal: processMetrics.nodeSummary?.total ?? null,
+    nodeProcessesListed: processMetrics.nodeSummary?.listed ?? null,
+    nodeProcessesSampledAt: processMetrics.nodeSummary?.sampledAt ?? null,
+    nodeProcesses: processMetrics.nodePayload,
     https: isHttpsReachable,
     certExpiration: certExpiration
   };
