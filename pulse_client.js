@@ -1,4 +1,5 @@
 const http = require('http');
+const fs = require('fs');
 const { execFile } = require('child_process');
 const { io } = require('socket.io-client');
 const si = require('systeminformation');
@@ -46,6 +47,10 @@ const PROCESSES_LIMIT = readNonNegativeInt('PROCESSES_LIMIT', 50);
 const NODE_PROCESSES_LIMIT = readNonNegativeInt('NODE_PROCESSES_LIMIT', 50);
 const PROCESSES_INTERVAL_MS = readNonNegativeInt('PROCESSES_INTERVAL_MS', 30000);
 const PROCESS_COMMAND_MAX_LENGTH = readNonNegativeInt('PROCESS_COMMAND_MAX_LENGTH', 240);
+const RESOURCE_REPORTING_ENABLED = process.env.RESOURCE_REPORTING_ENABLED === 'true';
+const RESOURCE_REPORT_INTERVAL_MS = readNonNegativeInt('RESOURCE_REPORT_INTERVAL_MS', 30000);
+const RESOURCE_DEFINITIONS_JSON = process.env.RESOURCE_DEFINITIONS_JSON || null;
+const RESOURCE_DEFINITIONS_PATH = process.env.RESOURCE_DEFINITIONS_PATH || null;
 let dockerContainersLogged = false;
 let lastDockerContainers = null;
 let lastDockerContainersHash = null;
@@ -528,6 +533,134 @@ async function emitMetrics(socket) {
   }
 }
 
+// === Resource Reporting ===
+
+function expandPlaceholders(value) {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(/\$\{HOST_KEY\}/g, HOST_KEY)
+    .replace(/\$\{DOMAIN\}/g, domain)
+    .replace(/\$\{INSTANCE_TYPE\}/g, INSTANCE_TYPE);
+}
+
+function expandResourcePlaceholders(obj) {
+  if (typeof obj === 'string') return expandPlaceholders(obj);
+  if (Array.isArray(obj)) return obj.map(expandResourcePlaceholders);
+  if (obj !== null && typeof obj === 'object') {
+    const result = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = expandResourcePlaceholders(value);
+    }
+    return result;
+  }
+  return obj;
+}
+
+function loadResourceDefinitions() {
+  if (RESOURCE_DEFINITIONS_PATH) {
+    try {
+      const content = fs.readFileSync(RESOURCE_DEFINITIONS_PATH, 'utf8');
+      const parsed = JSON.parse(content);
+      if (!Array.isArray(parsed)) {
+        console.warn('[RESOURCES] RESOURCE_DEFINITIONS_PATH must contain a JSON array');
+        return [];
+      }
+      return parsed;
+    } catch (err) {
+      console.warn('[RESOURCES] Failed to load resource definitions from path:', err.message);
+      return [];
+    }
+  }
+
+  if (RESOURCE_DEFINITIONS_JSON) {
+    try {
+      const parsed = JSON.parse(RESOURCE_DEFINITIONS_JSON);
+      if (!Array.isArray(parsed)) {
+        console.warn('[RESOURCES] RESOURCE_DEFINITIONS_JSON must be a JSON array');
+        return [];
+      }
+      return parsed;
+    } catch (err) {
+      console.warn('[RESOURCES] Failed to parse RESOURCE_DEFINITIONS_JSON:', err.message);
+      return [];
+    }
+  }
+
+  return [];
+}
+
+async function enrichResourceState(resource) {
+  let state = {};
+  const raw = resource.stateJson;
+  if (typeof raw === 'string') {
+    try { state = JSON.parse(raw); } catch { state = {}; }
+  } else if (raw !== null && typeof raw === 'object') {
+    state = { ...raw };
+  }
+
+  if (state.containerName) {
+    try {
+      const containers = await si.dockerContainers();
+      const name = state.containerName;
+      const match = containers.find((c) => c.name === name || c.name === `/${name}`);
+      if (match) {
+        state.containerId = match.id;
+        state.containerState = match.state;
+        state.containerStatus = match.status;
+        state.containerImage = match.image;
+      }
+    } catch (err) {
+      console.warn(`[RESOURCES] Docker enrichment failed for ${resource.resourceKey || '<unknown>'}:`, err.message);
+    }
+  }
+
+  return state;
+}
+
+function normalizeJsonField(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try { return JSON.parse(value); } catch { return value; }
+  }
+  return value;
+}
+
+async function reportResources() {
+  const definitions = loadResourceDefinitions();
+  if (definitions.length === 0) return;
+
+  for (const rawDef of definitions) {
+    const def = expandResourcePlaceholders(rawDef);
+    const resourceKey = def.resourceKey || '<unknown>';
+
+    try {
+      const stateJson = await enrichResourceState(def);
+
+      await axios.post(`${masterUrl}/infra/resources/register`, {
+        token: HOST_REG_TOKEN,
+        hostKey: HOST_KEY,
+        resource: {
+          resourceKey: def.resourceKey,
+          externalId: def.externalId,
+          type: def.type,
+          provider: def.provider,
+          name: def.name,
+          status: def.status,
+          desiredStatus: def.desiredStatus,
+          configJson: normalizeJsonField(def.configJson),
+          stateJson: normalizeJsonField(stateJson),
+          metadataJson: normalizeJsonField(def.metadataJson),
+          capabilitiesJson: normalizeJsonField(def.capabilitiesJson),
+        },
+      });
+      console.log(`[RESOURCES] Registered resource: ${resourceKey}`);
+    } catch (err) {
+      console.warn(`[RESOURCES] Failed to register resource ${resourceKey}:`, err.message);
+    }
+  }
+}
+
 // Init once
 async function init() {
   if (!masterUrl) {
@@ -631,6 +764,12 @@ async function init() {
       console.error(`[CLIENT] Server error: ${payload.code || 'unknown'} ${payload.message || ''}`);
     }
   });
+
+  if (RESOURCE_REPORTING_ENABLED) {
+    console.log(`[RESOURCES] Resource reporting enabled: interval=${RESOURCE_REPORT_INTERVAL_MS}ms`);
+    reportResources();
+    setInterval(reportResources, RESOURCE_REPORT_INTERVAL_MS);
+  }
 
   // Health endpoint
   http.createServer((req, res) => {
