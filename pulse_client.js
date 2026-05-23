@@ -67,6 +67,7 @@ let lastProcessSummary = null;
 
 let latestMetrics = {};
 let clientIP = '0.0.0.0';
+let privateIp = null;
 let certExpiration = null;
 let isHttpsReachable = false;
 let metricsEmitLogged = false;
@@ -82,12 +83,29 @@ async function fetchClientIP() {
   }
 }
 
-// Detect private/local IP from network interfaces (prefers 10.x, 172.x, 192.168.x)
-// Skips loopback, Docker bridge (docker0, br-*, veth*), and virtual interfaces.
-function getPrivateIp() {
+// Fetch the host's real VPC/LAN private IP.
+// On EC2, the metadata service returns the actual instance private IP even
+// when called from inside a Docker container (link-local, routed by hypervisor).
+// Falls back to os.networkInterfaces() for non-AWS environments.
+async function fetchPrivateIp() {
+  try {
+    const response = await axios.get('http://169.254.169.254/latest/meta-data/local-ipv4', {
+      timeout: 2000,
+    });
+    const ip = (response.data || '').toString().trim();
+    if (ip) {
+      privateIp = ip;
+      console.log("Got private IP (EC2 metadata):", privateIp);
+      return;
+    }
+  } catch (_) {
+    // Not on EC2 or metadata service unreachable — fall through
+  }
+
+  // Fallback: scan host network interfaces
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
-    if (/^(lo|docker|br-|veth)/i.test(name)) continue; // skip loopback + Docker/bridge
+    if (/^(lo|docker|br-|veth)/i.test(name)) continue;
     for (const iface of ifaces[name] || []) {
       if (iface.family !== 'IPv4' || iface.internal) continue;
       const { address } = iface;
@@ -96,17 +114,13 @@ function getPrivateIp() {
         address.startsWith('192.168.') ||
         /^172\.(1[6-9]|2\d|3[01])\./.test(address)
       ) {
-        return address;
+        privateIp = address;
+        console.log("Got private IP (network interfaces):", privateIp);
+        return;
       }
     }
   }
-  // Fall back to any non-internal IPv4 if no RFC-1918 address found
-  for (const name of Object.keys(ifaces)) {
-    for (const iface of ifaces[name] || []) {
-      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
-    }
-  }
-  return null;
+  console.warn("Could not determine private IP");
 }
 
 async function checkMasterCertificate() {
@@ -555,7 +569,7 @@ async function emitMetrics(socket) {
       metrics,
       stack: stackInfo,
       ip: clientIP,
-      privateIp: getPrivateIp(),
+      privateIp: privateIp,
       agentVersion: AGENT_VERSION,
     });
   } catch (err) {
@@ -701,7 +715,7 @@ async function init() {
     console.error('[CLIENT] HOST_REG_TOKEN is required');
     process.exit(1);
   }
-  await fetchClientIP();
+  await Promise.all([fetchClientIP(), fetchPrivateIp()]);
     if (ENABLE_CERT_CHECK) {
         try {
             await checkMasterCertificate();
@@ -740,7 +754,7 @@ async function init() {
           instanceType: INSTANCE_TYPE,
           domain,
           ip: clientIP,
-          privateIp: getPrivateIp(),
+          privateIp: privateIp,
           agentVersion: AGENT_VERSION,
           stack: stackInfo,
           metrics,
