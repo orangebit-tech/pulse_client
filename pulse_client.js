@@ -83,10 +83,11 @@ async function fetchClientIP() {
 }
 
 // Detect private/local IP from network interfaces (prefers 10.x, 172.x, 192.168.x)
+// Skips loopback, Docker bridge (docker0, br-*, veth*), and virtual interfaces.
 function getPrivateIp() {
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
-    if (/^lo/i.test(name)) continue; // skip loopback
+    if (/^(lo|docker|br-|veth)/i.test(name)) continue; // skip loopback + Docker/bridge
     for (const iface of ifaces[name] || []) {
       if (iface.family !== 'IPv4' || iface.internal) continue;
       const { address } = iface;

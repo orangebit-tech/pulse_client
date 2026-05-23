@@ -1,6 +1,6 @@
 {
   "name": "pulse-client",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Pulse client agent that reports system metrics to master server",
   "main": "pulse_client.js",
   "scripts": {
