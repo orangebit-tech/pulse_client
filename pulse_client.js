@@ -88,6 +88,28 @@ async function fetchClientIP() {
 // when called from inside a Docker container (link-local, routed by hypervisor).
 // Falls back to os.networkInterfaces() for non-AWS environments.
 async function fetchPrivateIp() {
+  // Try IMDSv2 first (required on most modern EC2 instances)
+  try {
+    const tokenResp = await axios.put(
+      'http://169.254.169.254/latest/api/token',
+      null,
+      { headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '21600' }, timeout: 2000 }
+    );
+    const ipResp = await axios.get('http://169.254.169.254/latest/meta-data/local-ipv4', {
+      headers: { 'X-aws-ec2-metadata-token': tokenResp.data },
+      timeout: 2000,
+    });
+    const ip = (ipResp.data || '').toString().trim();
+    if (ip) {
+      privateIp = ip;
+      console.log("Got private IP (EC2 IMDSv2):", privateIp);
+      return;
+    }
+  } catch (_) {
+    // IMDSv2 unavailable — try IMDSv1
+  }
+
+  // IMDSv1 fallback
   try {
     const response = await axios.get('http://169.254.169.254/latest/meta-data/local-ipv4', {
       timeout: 2000,
@@ -95,7 +117,7 @@ async function fetchPrivateIp() {
     const ip = (response.data || '').toString().trim();
     if (ip) {
       privateIp = ip;
-      console.log("Got private IP (EC2 metadata):", privateIp);
+      console.log("Got private IP (EC2 IMDSv1):", privateIp);
       return;
     }
   } catch (_) {
