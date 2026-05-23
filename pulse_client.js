@@ -7,6 +7,7 @@ const os = require('os');
 const axios = require('axios');
 console.log("[CLIENT] Pulse client starting...");
 require('dotenv').config();
+const AGENT_VERSION = require('./package.json').version;
 
 // Update here
 
@@ -554,6 +555,7 @@ async function emitMetrics(socket) {
       stack: stackInfo,
       ip: clientIP,
       privateIp: getPrivateIp(),
+      agentVersion: AGENT_VERSION,
     });
   } catch (err) {
     console.error('[CLIENT] Failed to gather metrics:', err.message);
@@ -738,6 +740,7 @@ async function init() {
           domain,
           ip: clientIP,
           privateIp: getPrivateIp(),
+          agentVersion: AGENT_VERSION,
           stack: stackInfo,
           metrics,
         },
