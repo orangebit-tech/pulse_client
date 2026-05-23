@@ -70,7 +70,7 @@ let certExpiration = null;
 let isHttpsReachable = false;
 let metricsEmitLogged = false;
 
-// Fetch IP once
+// Fetch public IP once
 async function fetchClientIP() {
   try {
     const response = await axios.get('https://api64.ipify.org?format=json');
@@ -79,6 +79,32 @@ async function fetchClientIP() {
   } catch (err) {
     console.error("Failed to fetch IP:", err.message);
   }
+}
+
+// Detect private/local IP from network interfaces (prefers 10.x, 172.x, 192.168.x)
+function getPrivateIp() {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    if (/^lo/i.test(name)) continue; // skip loopback
+    for (const iface of ifaces[name] || []) {
+      if (iface.family !== 'IPv4' || iface.internal) continue;
+      const { address } = iface;
+      if (
+        address.startsWith('10.') ||
+        address.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(address)
+      ) {
+        return address;
+      }
+    }
+  }
+  // Fall back to any non-internal IPv4 if no RFC-1918 address found
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return null;
 }
 
 async function checkMasterCertificate() {
@@ -527,6 +553,7 @@ async function emitMetrics(socket) {
       metrics,
       stack: stackInfo,
       ip: clientIP,
+      privateIp: getPrivateIp(),
     });
   } catch (err) {
     console.error('[CLIENT] Failed to gather metrics:', err.message);
@@ -710,6 +737,7 @@ async function init() {
           instanceType: INSTANCE_TYPE,
           domain,
           ip: clientIP,
+          privateIp: getPrivateIp(),
           stack: stackInfo,
           metrics,
         },
