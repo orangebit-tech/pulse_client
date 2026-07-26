@@ -52,6 +52,26 @@ const RESOURCE_REPORTING_ENABLED = process.env.RESOURCE_REPORTING_ENABLED === 't
 const RESOURCE_REPORT_INTERVAL_MS = readNonNegativeInt('RESOURCE_REPORT_INTERVAL_MS', 30000);
 const RESOURCE_DEFINITIONS_JSON = process.env.RESOURCE_DEFINITIONS_JSON || null;
 const RESOURCE_DEFINITIONS_PATH = process.env.RESOURCE_DEFINITIONS_PATH || null;
+const PROVIDER_MODE = process.env.PROVIDER_MODE === 'true';
+const COMMAND_AUTH_TOKEN = process.env.COMMAND_AUTH_TOKEN || null;
+const PROVIDER_REQUEST_CACHE_LIMIT = 500;
+// Storage telemetry is optional at load time on purpose: a partial deploy that
+// misses src/ must degrade to the previous metrics set, never crash-loop the
+// agent and take the host's monitoring offline with it.
+let storageCollector = { collect: async () => null };
+try {
+  const createStorageCollector = require('./src/storage');
+  storageCollector = createStorageCollector({
+    env: process.env,
+    log: console.log,
+    warn: console.warn,
+  });
+} catch (err) {
+  console.warn(
+    `[CLIENT] Storage collector unavailable (${err.message}) — continuing without storage telemetry. ` +
+      'Check that src/storage.js was deployed.',
+  );
+}
 let dockerContainersLogged = false;
 let lastDockerContainers = null;
 let lastDockerContainersHash = null;
@@ -71,6 +91,252 @@ let privateIp = null;
 let certExpiration = null;
 let isHttpsReachable = false;
 let metricsEmitLogged = false;
+let proxmoxProvider = null;
+const providerRequestCache = new Map();
+
+const PROVIDER_CAPABILITIES = {
+  canProvision: true,
+  provider: 'proxmox',
+  shapes: ['vm', 'lxc'],
+};
+
+const PROVIDER_COMMAND_RESULT_TYPES = {
+  'instance.provision': 'instance.provision.result',
+  'instance.destroy': 'instance.destroy.result',
+  'instance.status': 'instance.status.result',
+};
+
+function providerLog(message, ...args) {
+  console.log(`[PROVIDER] ${message}`, ...args);
+}
+
+function providerWarn(message, ...args) {
+  console.warn(`[PROVIDER] ${message}`, ...args);
+}
+
+function getProvider() {
+  if (!PROVIDER_MODE) {
+    return null;
+  }
+  if (!proxmoxProvider) {
+    // Lazy-loaded so normal guest agents do not load provider integration code.
+    const createProxmoxProvider = require('./src/providers/proxmox');
+    proxmoxProvider = createProxmoxProvider({
+      env: process.env,
+      log: providerLog,
+      warn: providerWarn,
+    });
+  }
+  return proxmoxProvider;
+}
+
+function getResultType(commandType) {
+  return PROVIDER_COMMAND_RESULT_TYPES[commandType] || null;
+}
+
+function isProviderCommand(payload) {
+  return Boolean(payload && getResultType(payload.type));
+}
+
+function isCommandAuthorized(payload) {
+  return Boolean(COMMAND_AUTH_TOKEN && payload.commandAuthToken === COMMAND_AUTH_TOKEN);
+}
+
+function emitProviderResult(socket, result) {
+  socket.emit('avero:msg', {
+    ...result,
+    token: HOST_REG_TOKEN,
+    hostKey: HOST_KEY,
+  });
+}
+
+function emitProviderProgress(socket, requestId, phase) {
+  socket.emit('avero:msg', {
+    type: 'instance.provision.progress',
+    token: HOST_REG_TOKEN,
+    hostKey: HOST_KEY,
+    requestId,
+    phase,
+  });
+}
+
+function trimProviderRequestCache() {
+  if (providerRequestCache.size <= PROVIDER_REQUEST_CACHE_LIMIT) {
+    return;
+  }
+
+  for (const [requestId, entry] of providerRequestCache.entries()) {
+    if (providerRequestCache.size <= PROVIDER_REQUEST_CACHE_LIMIT) {
+      return;
+    }
+    if (entry.status !== 'pending') {
+      providerRequestCache.delete(requestId);
+    }
+  }
+}
+
+function makeProviderResult(commandType, requestId, fields) {
+  return {
+    type: getResultType(commandType),
+    requestId,
+    ...fields,
+  };
+}
+
+function validateProviderCommandPayload(payload) {
+  if (payload.type === 'instance.provision') {
+    if (payload.shape !== 'vm' && payload.shape !== 'lxc') {
+      throw new Error('invalid shape: expected "vm" or "lxc"');
+    }
+    if (!payload.spec || typeof payload.spec !== 'object') {
+      throw new Error('missing spec');
+    }
+    return;
+  }
+
+  if (payload.type === 'instance.destroy' || payload.type === 'instance.status') {
+    if (typeof payload.instanceId !== 'string' || payload.instanceId.trim() === '') {
+      throw new Error('missing instanceId');
+    }
+  }
+}
+
+async function executeProviderCommand(socket, payload) {
+  const provider = getProvider();
+  if (!provider) {
+    return makeProviderResult(payload.type, payload.requestId, {
+      ok: false,
+      error: 'provider mode is disabled',
+    });
+  }
+
+  try {
+    validateProviderCommandPayload(payload);
+
+    if (payload.type === 'instance.provision') {
+      emitProviderProgress(socket, payload.requestId, 'accepted');
+      const created = await provider.createInstance({
+        shape: payload.shape,
+        spec: payload.spec,
+        requestId: payload.requestId,
+        onProgress: (phase) => emitProviderProgress(socket, payload.requestId, phase),
+      });
+      return makeProviderResult(payload.type, payload.requestId, {
+        ok: true,
+        instanceId: created.instanceId,
+        ip: created.ip || null,
+        state: created.state || 'running',
+      });
+    }
+
+    if (payload.type === 'instance.destroy') {
+      const destroyed = await provider.destroyInstance(payload.instanceId);
+      if (destroyed && destroyed.ok === false) {
+        return makeProviderResult(payload.type, payload.requestId, {
+          ok: false,
+          found: destroyed.found === true,
+          error: destroyed.error || 'destroy failed',
+        });
+      }
+      return makeProviderResult(payload.type, payload.requestId, {
+        ok: true,
+        found: destroyed?.found === true,
+      });
+    }
+
+    if (payload.type === 'instance.status') {
+      const status = await provider.getInstanceStatus(payload.instanceId);
+      return makeProviderResult(payload.type, payload.requestId, {
+        ok: true,
+        state: status.state,
+        stats: status.stats || null,
+      });
+    }
+  } catch (err) {
+    return makeProviderResult(payload.type, payload.requestId, {
+      ok: false,
+      error: err.message,
+    });
+  }
+
+  return makeProviderResult(payload.type, payload.requestId, {
+    ok: false,
+    error: `unsupported command type: ${payload.type}`,
+  });
+}
+
+async function handleProviderCommand(socket, payload) {
+  if (payload.hostKey !== HOST_KEY) {
+    providerWarn(
+      `Ignoring ${payload.type} for hostKey=${payload.hostKey || '<missing>'}; this hostKey=${HOST_KEY}`,
+    );
+    return;
+  }
+
+  const requestId = typeof payload.requestId === 'string' ? payload.requestId.trim() : '';
+  const resultType = getResultType(payload.type);
+  if (!requestId) {
+    emitProviderResult(socket, {
+      type: resultType,
+      requestId: payload.requestId || null,
+      ok: false,
+      error: 'missing requestId',
+    });
+    return;
+  }
+  payload.requestId = requestId;
+
+  if (!isCommandAuthorized(payload)) {
+    emitProviderResult(socket, makeProviderResult(payload.type, requestId, {
+      ok: false,
+      error: COMMAND_AUTH_TOKEN
+        ? 'unauthorized: invalid commandAuthToken'
+        : 'unauthorized: COMMAND_AUTH_TOKEN is not configured',
+    }));
+    return;
+  }
+
+  const cached = providerRequestCache.get(requestId);
+  if (cached) {
+    providerLog(`Re-emitting cached result for requestId=${requestId} type=${cached.type}`);
+    if (cached.result) {
+      emitProviderResult(socket, cached.result);
+      return;
+    }
+    cached.promise.then((result) => emitProviderResult(socket, result));
+    return;
+  }
+
+  providerLog(`Handling ${payload.type} requestId=${requestId}`);
+  const entry = {
+    type: payload.type,
+    status: 'pending',
+    result: null,
+    promise: null,
+  };
+  providerRequestCache.set(requestId, entry);
+  trimProviderRequestCache();
+
+  entry.promise = executeProviderCommand(socket, payload)
+    .then((result) => {
+      entry.status = 'completed';
+      entry.result = result;
+      emitProviderResult(socket, result);
+      return result;
+    })
+    .catch((err) => {
+      const result = makeProviderResult(payload.type, requestId, {
+        ok: false,
+        error: err.message,
+      });
+      entry.status = 'completed';
+      entry.result = result;
+      emitProviderResult(socket, result);
+      return result;
+    });
+
+  await entry.promise;
+}
 
 // Fetch public IP once
 async function fetchClientIP() {
@@ -523,6 +789,7 @@ async function collectMetrics() {
     }
   }
   const processMetrics = await collectProcessMetrics();
+  const storage = await storageCollector.collect();
 
   return {
     cpuLoad: cpu.currentLoad,
@@ -555,6 +822,7 @@ async function collectMetrics() {
     nodeProcessesListed: processMetrics.nodeSummary?.listed ?? null,
     nodeProcessesSampledAt: processMetrics.nodeSummary?.sampledAt ?? null,
     nodeProcesses: processMetrics.nodePayload,
+    ...(storage ? { storage } : {}),
     https: isHttpsReachable,
     certExpiration: certExpiration
   };
@@ -655,6 +923,59 @@ function loadResourceDefinitions() {
   return [];
 }
 
+async function buildProviderResourceDefinition() {
+  const provider = getProvider();
+  if (!provider) {
+    return null;
+  }
+
+  const capacity = await provider.getCapacity();
+  return {
+    resourceKey: '${HOST_KEY}:provider:proxmox',
+    externalId: '${HOST_KEY}',
+    type: 'HOST',
+    provider: 'PROXMOX',
+    name: `${os.hostname()} Proxmox Provider`,
+    status: 'ACTIVE',
+    desiredStatus: 'ACTIVE',
+    stateJson: {
+      hostKey: '${HOST_KEY}',
+      provider: 'proxmox',
+      node: capacity.node || null,
+      sampledAt: capacity.sampledAt || Date.now(),
+    },
+    metadataJson: {
+      agentVersion: AGENT_VERSION,
+      providerMode: true,
+    },
+    capabilitiesJson: {
+      ...PROVIDER_CAPABILITIES,
+      totalVcpu: capacity.totalVcpu,
+      freeVcpu: capacity.freeVcpu,
+      totalMemoryMb: capacity.totalMemoryMb,
+      freeMemoryMb: capacity.freeMemoryMb,
+      storagePools: capacity.storagePools,
+    },
+  };
+}
+
+async function collectResourceDefinitions() {
+  const definitions = loadResourceDefinitions();
+
+  if (PROVIDER_MODE) {
+    try {
+      const providerResource = await buildProviderResourceDefinition();
+      if (providerResource) {
+        definitions.push(providerResource);
+      }
+    } catch (err) {
+      providerWarn('Failed to collect provider capacity:', err.message);
+    }
+  }
+
+  return definitions;
+}
+
 async function enrichResourceState(resource) {
   let state = {};
   const raw = resource.stateJson;
@@ -693,7 +1014,7 @@ function normalizeJsonField(value) {
 }
 
 async function reportResources() {
-  const definitions = loadResourceDefinitions();
+  const definitions = await collectResourceDefinitions();
   if (definitions.length === 0) return;
 
   for (const rawDef of definitions) {
@@ -737,6 +1058,17 @@ async function init() {
     console.error('[CLIENT] HOST_REG_TOKEN is required');
     process.exit(1);
   }
+  if (PROVIDER_MODE) {
+    providerLog('Provider mode enabled: provider=proxmox shapes=vm,lxc');
+    if (!COMMAND_AUTH_TOKEN) {
+      providerWarn('COMMAND_AUTH_TOKEN is not configured; inbound provider commands will be rejected');
+    }
+    try {
+      getProvider();
+    } catch (err) {
+      providerWarn('Failed to initialize provider integration:', err.message);
+    }
+  }
   await Promise.all([fetchClientIP(), fetchPrivateIp()]);
     if (ENABLE_CERT_CHECK) {
         try {
@@ -767,20 +1099,24 @@ async function init() {
       console.log(
         `[CLIENT] Registering host with master: hostKey=${HOST_KEY} hostname=${hostname} ip=${clientIP} stackOs=${stackInfo.os}`,
       );
+      const hostPayload = {
+        hostKey: HOST_KEY,
+        hostname,
+        instanceType: INSTANCE_TYPE,
+        domain,
+        ip: clientIP,
+        privateIp: privateIp,
+        agentVersion: AGENT_VERSION,
+        stack: stackInfo,
+        metrics,
+      };
+      if (PROVIDER_MODE) {
+        hostPayload.capabilities = PROVIDER_CAPABILITIES;
+      }
       socket.emit('avero:msg', {
         type: 'host.register',
         token: HOST_REG_TOKEN,
-        host: {
-          hostKey: HOST_KEY,
-          hostname,
-          instanceType: INSTANCE_TYPE,
-          domain,
-          ip: clientIP,
-          privateIp: privateIp,
-          agentVersion: AGENT_VERSION,
-          stack: stackInfo,
-          metrics,
-        },
+        host: hostPayload,
       });
     };
 
@@ -831,9 +1167,14 @@ async function init() {
     if (payload.type === 'error') {
       console.error(`[CLIENT] Server error: ${payload.code || 'unknown'} ${payload.message || ''}`);
     }
+    if (PROVIDER_MODE && isProviderCommand(payload)) {
+      handleProviderCommand(socket, payload).catch((err) => {
+        providerWarn(`Failed to handle ${payload.type}:`, err.message);
+      });
+    }
   });
 
-  if (RESOURCE_REPORTING_ENABLED) {
+  if (RESOURCE_REPORTING_ENABLED || PROVIDER_MODE) {
     console.log(`[RESOURCES] Resource reporting enabled: interval=${RESOURCE_REPORT_INTERVAL_MS}ms`);
     reportResources();
     setInterval(reportResources, RESOURCE_REPORT_INTERVAL_MS);

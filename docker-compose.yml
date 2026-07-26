@@ -3,6 +3,12 @@ services:
     build: .
     container_name: pulse-client
     pid: host
+    # Storage telemetry reads /proc/<pid>/fd to find deleted-but-open files.
+    # Inspecting processes owned by other users (mysqld runs as uid 999) needs
+    # CAP_SYS_PTRACE; without it the agent sees only its own and reports
+    # ghost.deniedPids so the numbers are known to be a lower bound.
+    cap_add:
+      - SYS_PTRACE
     env_file:
       - .env
     environment:
@@ -12,4 +18,16 @@ services:
       - "9443:9443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only host root: per-mount usage, inode counts, container log sizes
+      # and the directory walk all need to see the real filesystem.
+      #
+      # rslave propagation matters on multi-volume hosts. A plain bind of / does
+      # not carry nested mounts, so statfs on /hostfs/var would silently return
+      # the root filesystem's numbers instead of the /var volume's.
+      - type: bind
+        source: /
+        target: /hostfs
+        read_only: true
+        bind:
+          propagation: rslave
     restart: unless-stopped
